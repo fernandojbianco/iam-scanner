@@ -1,5 +1,7 @@
 # IAM Scanner
 
+![IAM Scanner](IAM%20Scanner.png)
+
 Auditoria contínua de acessos privilegiados em ambientes Azure. A aplicação varre periodicamente dois planos de identidade e permissão — **Azure RBAC** (subscriptions) e **Entra ID** (diretório) — classifica cada atribuição por nível de risco, detecta o que mudou entre uma coleta e a próxima, e avisa a equipe de segurança no Microsoft Teams quando algo sensível é concedido ou revogado.
 
 O objetivo é dar visibilidade contínua de "quem tem acesso a quê" sem depender de auditorias manuais pontuais — qualquer concessão de um papel crítico (`Owner`, `User Access Administrator`, `Global Administrator`, ...) aparece no dashboard e gera alerta assim que é detectada.
