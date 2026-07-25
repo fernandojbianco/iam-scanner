@@ -1,0 +1,28 @@
+services:
+  iam-scanner:
+    build: .
+    image: iam-scanner:latest
+    container_name: iam-scanner
+    ports:
+      - "8080:8080"
+    environment:
+      AZURE_TENANT_ID:      ${AZURE_TENANT_ID}
+      AZURE_CLIENT_ID:      ${AZURE_CLIENT_ID}
+      AZURE_CLIENT_SECRET:  ${AZURE_CLIENT_SECRET}
+      # Opcional: lista de IDs separados por vírgula.
+      # Se omitido, descobre automaticamente todas as subscriptions acessíveis.
+      SUBSCRIPTION_IDS:     ${SUBSCRIPTION_IDS:-}
+      # Intervalo entre coletas (minutos). Padrão: 60.
+      SCAN_INTERVAL_MINUTES: ${SCAN_INTERVAL_MINUTES:-60}
+      # Notificações Teams (opcional — deixe vazio para desabilitar).
+      TEAMS_WEBHOOK_URL:    ${TEAMS_WEBHOOK_URL:-}
+      TEAMS_DASHBOARD_URL:  ${TEAMS_DASHBOARD_URL:-}
+      TEAMS_HEARTBEAT:      ${TEAMS_HEARTBEAT:-false}
+      NOTIFY_LEVELS:        ${NOTIFY_LEVELS:-CRITICO,ALTO}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
