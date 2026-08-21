@@ -17,6 +17,7 @@ _RISK_COLOR = {
     "ALTO":    "warning",     # laranja/amarelo
     "MEDIO":   "accent",      # azul
     "LEITURA": "good",        # verde
+    "GRUPO":   "warning",     # laranja/amarelo
 }
 
 _RISK_EMOJI = {
@@ -24,12 +25,25 @@ _RISK_EMOJI = {
     "ALTO":    "🟠",
     "MEDIO":   "🟡",
     "LEITURA": "🟢",
+    "GRUPO":   "👥",
 }
 
 _SOURCE_LABEL = {
     "azure": "Azure RBAC",
     "entra": "Entra ID",
+    "group": "Grupo Monitorado",
 }
+
+_WORKLOAD_LABEL = {
+    "M365": "Microsoft 365",
+    "Entra ID": "Entra ID",
+}
+
+
+def _source_label(c: "Change") -> str:
+    if c.source == "entra":
+        return _WORKLOAD_LABEL.get(c.workload, "Entra ID")
+    return _SOURCE_LABEL[c.source]
 
 _KIND_LABEL = {
     "added":   "➕ ADICIONADO",
@@ -62,7 +76,7 @@ def _build_card(changes: list[Change], scan_time: str, dashboard_url: str) -> di
                 "type": "TableRow",
                 "cells": [
                     {"type": "TableCell", "items": [{"type": "TextBlock", "text": f"{_RISK_EMOJI[c.risk_level]} **{c.risk_level}**", "wrap": True, "color": _RISK_COLOR.get(c.risk_level, "default")}]},
-                    {"type": "TableCell", "items": [{"type": "TextBlock", "text": _SOURCE_LABEL[c.source], "wrap": True, "isSubtle": True}]},
+                    {"type": "TableCell", "items": [{"type": "TextBlock", "text": _source_label(c), "wrap": True, "isSubtle": True}]},
                     {"type": "TableCell", "items": [{"type": "TextBlock", "text": c.principal, "wrap": True, "fontType": "Monospace", "size": "Small"}]},
                     {"type": "TableCell", "items": [{"type": "TextBlock", "text": c.role, "wrap": True, "size": "Small"}]},
                     {"type": "TableCell", "items": [{"type": "TextBlock", "text": scope_display + sub_display, "wrap": True, "isSubtle": True, "size": "Small"}]},
@@ -80,7 +94,7 @@ def _build_card(changes: list[Change], scan_time: str, dashboard_url: str) -> di
         },
         {
             "type": "TextBlock",
-            "text": f"Scan concluído em **{dt}**",
+            "text": f"Scan concluído em **{dt}** · Paraná Banco S/A",
             "isSubtle": True,
             "size": "Small",
             "spacing": "None",
@@ -165,13 +179,15 @@ def _build_summary_card(result_dict: dict, scan_time: str, dashboard_url: str) -
 
     body = [
         {"type": "TextBlock", "text": "✅ Scan IAM concluído — sem mudanças críticas", "weight": "Bolder", "size": "Medium"},
-        {"type": "TextBlock", "text": f"Concluído em {dt}", "isSubtle": True, "size": "Small", "spacing": "None"},
+        {"type": "TextBlock", "text": f"Concluído em {dt} · Paraná Banco S/A", "isSubtle": True, "size": "Small", "spacing": "None"},
         {"type": "FactSet", "spacing": "Medium", "facts": [
             {"title": "Subscriptions:",         "value": str(s.get("total_subscriptions", 0))},
             {"title": "Atribuições Azure RBAC:", "value": str(s.get("total_azure_assignments", 0))},
             {"title": "Roles Críticas Azure:",   "value": str(s.get("critical_azure", 0))},
             {"title": "Atribuições Entra ID:",   "value": str(s.get("total_entra_assignments", 0))},
             {"title": "Roles Críticas Entra:",   "value": str(s.get("critical_entra", 0))},
+            {"title": "Atribuições Microsoft 365:", "value": str(s.get("total_m365_assignments", 0))},
+            {"title": "Roles Críticas M365:",    "value": str(s.get("critical_m365", 0))},
         ]},
     ]
     actions = []
