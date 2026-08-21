@@ -29,6 +29,10 @@ RISK_HIGH = {
     "Application Administrator", "Cloud Application Administrator",
     "Directory Writers", "Groups Administrator", "Helpdesk Administrator",
     "Password Administrator",
+    # Microsoft 365
+    "Exchange Administrator", "SharePoint Administrator", "Teams Administrator",
+    "Teams Communications Administrator", "Skype for Business Administrator",
+    "Office Apps Administrator",
 }
 RISK_MEDIUM = {
     "Key Vault Secrets Officer", "Key Vault Contributor", "Storage Account Key Operator Service Role",
@@ -37,6 +41,12 @@ RISK_MEDIUM = {
     "Global Reader", "Directory Readers", "Security Reader", "Security Operator",
     "Identity Governance Administrator", "Compliance Administrator",
     "Compliance Data Administrator", "Guest Inviter",
+    # Microsoft 365
+    "Exchange Recipient Administrator", "SharePoint Embedded Administrator",
+    "Teams Devices Administrator", "Teams Communications Support Engineer",
+    "Teams Communications Support Specialist", "Viva Engage Administrator",
+    "Viva Goals Administrator", "Viva Pulse Administrator", "Insights Administrator",
+    "Search Administrator", "Message Center Privacy Reader", "Kaizala Administrator",
 }
 RISK_LOW = {
     "Reader", "Billing Reader", "Cost Management Reader", "Storage Blob Data Reader",
@@ -44,6 +54,23 @@ RISK_LOW = {
     "Reports Reader", "License Administrator", "Attribute Assignment Reader",
     "Attribute Definition Reader", "Directory Synchronization Accounts",
     "Usage Summary Reports Reader",
+    # Microsoft 365
+    "Insights Business Leader", "Message Center Reader", "Search Editor",
+}
+
+# Roles administrativas específicas do Microsoft 365 (Exchange/SharePoint/Teams/Viva/etc.)
+# usadas apenas para rotular a origem ("workload") da atribuição no dashboard/notificações —
+# a coleta em si já vem do mesmo endpoint de directory roles do Entra ID.
+M365_ROLES = {
+    "Exchange Administrator", "Exchange Recipient Administrator",
+    "SharePoint Administrator", "SharePoint Embedded Administrator",
+    "Teams Administrator", "Teams Communications Administrator",
+    "Teams Communications Support Engineer", "Teams Communications Support Specialist",
+    "Teams Devices Administrator", "Skype for Business Administrator",
+    "Viva Engage Administrator", "Viva Goals Administrator", "Viva Pulse Administrator",
+    "Insights Administrator", "Insights Business Leader",
+    "Office Apps Administrator", "Search Administrator", "Search Editor",
+    "Message Center Reader", "Message Center Privacy Reader", "Kaizala Administrator",
 }
 
 
@@ -57,6 +84,10 @@ def classify_risk(role: str) -> str:
     if role in RISK_LOW:
         return "LEITURA"
     return "INFO"
+
+
+def classify_workload(role: str) -> str:
+    return "M365" if role in M365_ROLES else "Entra ID"
 
 
 def scope_type(scope: str, sub_id: str) -> str:
@@ -88,6 +119,7 @@ class EntraAssignment:
     role: str
     risk_level: str
     scope: str
+    workload: str = "Entra ID"
 
 
 @dataclass
@@ -98,6 +130,8 @@ class ScanResult:
     entra_assignments: list[dict]
     summary: dict
     errors: list[str] = field(default_factory=list)
+    group_names: dict[str, str] = field(default_factory=dict)
+    group_memberships: dict[str, list[dict]] = field(default_factory=dict)
 
 
 class IAMCollector:
@@ -218,14 +252,64 @@ class IAMCollector:
                 role=role,
                 risk_level=classify_risk(role),
                 scope=scope if scope != "/" else "Tenant inteiro",
+                workload=classify_workload(role),
             ))
         return assignments
+
+    # ------------------------------------------------------------------ #
+    # Grupos monitorados                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _collect_group_names(self, group_ids: list[str], token: str) -> dict[str, str]:
+        headers = {"Authorization": f"Bearer {token}"}
+        names: dict[str, str] = {}
+        with httpx.Client(timeout=30) as client:
+            for gid in group_ids:
+                resp = client.get(f"{GRAPH_BASE}/groups/{gid}?$select=id,displayName", headers=headers)
+                resp.raise_for_status()
+                names[gid] = resp.json().get("displayName", gid)
+        return names
+
+    def _collect_group_members(self, group_id: str, token: str) -> list[dict]:
+        raw = self._graph_paginate(f"/groups/{group_id}/members?$select=id,displayName,userPrincipalName", token)
+        members = []
+        for m in raw:
+            p_type = m.get("@odata.type", "").replace("#microsoft.graph.", "") or "user"
+            name = m.get("userPrincipalName") or m.get("displayName") or m.get("id")
+            members.append({"id": m.get("id"), "principal": name, "principal_type": p_type})
+        return members
+
+    def _collect_watched_groups(self, group_ids: list[str], errors: list[str]) -> tuple[dict[str, str], dict[str, list[dict]]]:
+        group_names: dict[str, str] = {}
+        group_memberships: dict[str, list[dict]] = {}
+        try:
+            token = self.credential.get_token("https://graph.microsoft.com/.default").token
+        except Exception as e:
+            log.warning("Failed to acquire token for watched groups: %s", e)
+            errors.append(f"watched_groups: {e}")
+            return group_names, group_memberships
+
+        try:
+            group_names = self._collect_group_names(group_ids, token)
+        except Exception as e:
+            log.warning("Failed to resolve watched group names: %s", e)
+            errors.append(f"watched_groups/names: {e}")
+            group_names = {gid: gid for gid in group_ids}
+
+        for gid in group_ids:
+            try:
+                group_memberships[gid] = self._collect_group_members(gid, token)
+            except Exception as e:
+                log.warning("Failed to collect members for group %s: %s", gid, e)
+                errors.append(f"watched_groups/{gid}: {e}")
+
+        return group_names, group_memberships
 
     # ------------------------------------------------------------------ #
     # Full scan                                                             #
     # ------------------------------------------------------------------ #
 
-    def run(self, subscription_ids: Optional[list[str]] = None) -> ScanResult:
+    def run(self, subscription_ids: Optional[list[str]] = None, watched_group_ids: Optional[list[str]] = None) -> ScanResult:
         now = datetime.now(timezone.utc).isoformat()
         errors: list[str] = []
 
@@ -275,19 +359,33 @@ class IAMCollector:
             log.warning("Entra ID collection failed: %s", e)
             errors.append(f"entra: {e}")
 
+        # Grupos monitorados
+        group_names: dict[str, str] = {}
+        group_memberships: dict[str, list[dict]] = {}
+        if watched_group_ids:
+            log.info("Collecting membership of %d watched group(s) ...", len(watched_group_ids))
+            group_names, group_memberships = self._collect_watched_groups(watched_group_ids, errors)
+
         # Summary
         from collections import Counter
         risk_counter_azure = Counter(r.risk_level for r in azure_rows)
         risk_counter_entra = Counter(r.risk_level for r in entra_rows)
+        m365_rows = [r for r in entra_rows if r.workload == "M365"]
+        risk_counter_m365 = Counter(r.risk_level for r in m365_rows)
 
         summary = {
             "total_subscriptions": len(subs),
             "total_azure_assignments": len(azure_rows),
             "total_entra_assignments": len(entra_rows),
+            "total_m365_assignments": len(m365_rows),
             "azure_by_risk": dict(risk_counter_azure),
             "entra_by_risk": dict(risk_counter_entra),
+            "m365_by_risk": dict(risk_counter_m365),
             "critical_azure": risk_counter_azure.get("CRITICO", 0),
             "critical_entra": risk_counter_entra.get("CRITICO", 0),
+            "critical_m365": risk_counter_m365.get("CRITICO", 0),
+            "total_watched_groups": len(group_memberships),
+            "total_watched_group_members": sum(len(m) for m in group_memberships.values()),
         }
 
         def as_dict(obj):
@@ -306,4 +404,6 @@ class IAMCollector:
             ))],
             summary=summary,
             errors=errors,
+            group_names=group_names,
+            group_memberships=group_memberships,
         )

@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from .collector import IAMCollector, ScanResult
 from .differ import diff as iam_diff
+from .differ import diff_groups
 from .notifier import send_changes, send_summary
 
 load_dotenv()
@@ -41,6 +42,10 @@ TEAMS_DASHBOARD_URL = os.getenv("TEAMS_DASHBOARD_URL", "")
 TEAMS_HEARTBEAT    = os.getenv("TEAMS_HEARTBEAT", "false").lower() == "true"
 NOTIFY_LEVELS_RAW  = os.getenv("NOTIFY_LEVELS", "CRITICO,ALTO")
 NOTIFY_LEVELS      = {lvl.strip() for lvl in NOTIFY_LEVELS_RAW.split(",") if lvl.strip()}
+WATCHED_GROUPS_RAW = os.getenv("WATCHED_GROUPS", "")
+WATCHED_GROUPS: Optional[list[str]] = (
+    [g.strip() for g in WATCHED_GROUPS_RAW.split(",") if g.strip()] or None
+)
 
 # ------------------------------------------------------------------ #
 # State (in-memory, single instance)                                   #
@@ -65,7 +70,7 @@ def do_scan():
     log.info("Starting IAM scan ...")
     try:
         collector = IAMCollector(TENANT_ID, CLIENT_ID, CLIENT_SECRET)
-        result = collector.run(SUBSCRIPTION_IDS)
+        result = collector.run(SUBSCRIPTION_IDS, WATCHED_GROUPS)
 
         previous: Optional[ScanResult] = _state["result"]
         _state["previous_result"] = previous
@@ -92,6 +97,11 @@ def do_scan():
                     "entra_assignments": previous.entra_assignments,
                 }
                 changes = iam_diff(prev_dict, curr_dict, notify_levels=NOTIFY_LEVELS)
+                if WATCHED_GROUPS:
+                    group_changes = diff_groups(previous.group_memberships, result.group_memberships, result.group_names)
+                    if group_changes:
+                        log.info("Detected %d watched group membership change(s).", len(group_changes))
+                    changes = group_changes + changes
                 if changes:
                     log.info("Detected %d IAM change(s) — sending Teams notification.", len(changes))
                     send_changes(TEAMS_WEBHOOK_URL, changes, result.collected_at, TEAMS_DASHBOARD_URL)
@@ -163,6 +173,10 @@ def get_data():
         "azure_assignments":   r.azure_assignments,
         "entra_assignments":   r.entra_assignments,
         "errors":              r.errors,
+        "watched_groups": [
+            {"id": gid, "name": r.group_names.get(gid, gid), "members": r.group_memberships.get(gid, [])}
+            for gid in (WATCHED_GROUPS or [])
+        ],
     }
 
 
@@ -194,7 +208,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>IAM Scanner</title>
+<title>IAM Scanner — Paraná Banco</title>
 <style>
 :root{
   --bg:#EDF1F7;--surface:#FFF;--s2:#F5F7FA;--border:#D3DCE8;
@@ -287,8 +301,8 @@ tr.dr:hover td{background:#F8FAFD}
 .loading svg{animation:spin 1s linear infinite;margin-bottom:12px}
 @keyframes spin{to{transform:rotate(360deg)}}
 
-.sub-tabs{display:flex;border-bottom:1px solid var(--border);padding:0 14px;gap:2px;background:var(--s2)}
-.stab{padding:9px 13px;font-size:12.5px;font-weight:500;color:var(--t2);cursor:pointer;border:none;border-bottom:2px solid transparent;margin-bottom:-1px;background:none;font-family:var(--ui);display:flex;align-items:center;gap:5px;transition:color .12s}
+.sub-tabs{display:flex;border-bottom:1px solid var(--border);padding:0 14px;gap:2px;background:var(--s2);overflow-x:auto;scrollbar-width:thin}
+.stab{padding:9px 13px;font-size:12.5px;font-weight:500;color:var(--t2);cursor:pointer;border:none;border-bottom:2px solid transparent;margin-bottom:-1px;background:none;font-family:var(--ui);display:flex;align-items:center;gap:5px;transition:color .12s;flex-shrink:0;white-space:nowrap}
 .stab:hover{color:var(--text)}
 .stab.active{color:var(--az);border-bottom-color:var(--az)}
 .stab-cnt{background:var(--bg);border-radius:9px;padding:1px 6px;font-size:10.5px;font-variant-numeric:tabular-nums}
@@ -310,7 +324,7 @@ tr.dr:hover td{background:#F8FAFD}
   </div>
   <div>
     <div class="hdr-title">IAM Scanner</div>
-    <div class="hdr-sub" id="hdr-sub">Auditoria contínua de acessos Azure/Entra ID</div>
+    <div class="hdr-sub" id="hdr-sub">Paraná Banco S/A — Auditoria contínua de acessos</div>
   </div>
   <div class="hdr-right">
     <span class="chip" id="chip-status">Carregando…</span>
@@ -346,10 +360,10 @@ tr.dr:hover td{background:#F8FAFD}
     </div>
 
     <!-- ENTRA ID -->
-    <div class="section-title">Entra ID — Directory Roles</div>
+    <div class="section-title">Entra ID &amp; Microsoft 365 — Directory Roles</div>
     <div class="panel">
       <div class="panel-hdr">
-        <span class="panel-title">Atribuições de roles do diretório (Graph API)</span>
+        <span class="panel-title">Atribuições de roles do diretório, incluindo M365 (Graph API)</span>
         <span class="panel-count" id="entra-count"></span>
         <button class="btn btn-csv" onclick="exportCSV('entra')" style="margin-left:8px">
           <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
@@ -360,14 +374,22 @@ tr.dr:hover td{background:#F8FAFD}
         <div class="sw"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg><input class="srch" id="srch-entra" placeholder="Filtrar…"></div>
         <select class="fsel" id="fsel-entra"><option value="">Todos os níveis</option><option value="CRITICO">Crítico</option><option value="ALTO">Alto</option><option value="MEDIO">Médio</option><option value="LEITURA">Leitura</option></select>
         <select class="fsel" id="ftype-entra"><option value="">Todos os tipos</option><option value="user">Usuário</option><option value="servicePrincipal">Service Principal</option><option value="group">Grupo</option></select>
+        <select class="fsel" id="fwl-entra"><option value="">Todas as origens</option><option value="Entra ID">Entra ID</option><option value="M365">Microsoft 365</option></select>
         <span class="rcount" id="rc-entra"></span>
       </div>
-      <div class="tw"><table><thead><tr><th>Principal</th><th>Tipo</th><th>Role Entra ID</th><th>Nível</th><th>Escopo</th></tr></thead><tbody id="tbl-entra"></tbody></table></div>
+      <div class="tw"><table><thead><tr><th>Principal</th><th>Tipo</th><th>Role</th><th>Origem</th><th>Nível</th><th>Escopo</th></tr></thead><tbody id="tbl-entra"></tbody></table></div>
       <div class="empty" id="empty-entra" style="display:none">Nenhum resultado.</div>
+    </div>
+
+    <!-- GRUPOS MONITORADOS -->
+    <div class="section-title" id="groups-section-title" style="display:none">Grupos Monitorados</div>
+    <div class="panel" id="groups-panel" style="display:none">
+      <div class="sub-tabs" id="groups-tabs"></div>
+      <div id="groups-panels"></div>
     </div>
   </div>
 </div>
-<div class="footer" id="footer">IAM Scanner</div>
+<div class="footer" id="footer">IAM Scanner — Paraná Banco S/A</div>
 
 <script>
 const TC = {CRITICO:"pc",ALTO:"ph",MEDIO:"pm",LEITURA:"pl",INFO:"pi"};
@@ -433,6 +455,8 @@ function render(data){
     <div class="gs danger"><div class="gs-lbl">RBAC Crítico</div><div class="gs-val">${s.critical_azure||0}</div><div class="gs-hint">Owner / UAA</div></div>
     <div class="gs"><div class="gs-lbl">Entra ID</div><div class="gs-val">${(s.total_entra_assignments||0).toLocaleString("pt-BR")}</div><div class="gs-hint">Roles do diretório</div></div>
     <div class="gs danger"><div class="gs-lbl">Entra Crítico</div><div class="gs-val">${s.critical_entra||0}</div><div class="gs-hint">Global Admin / PRA</div></div>
+    <div class="gs"><div class="gs-lbl">Microsoft 365</div><div class="gs-val">${(s.total_m365_assignments||0).toLocaleString("pt-BR")}</div><div class="gs-hint">Exchange / SharePoint / Teams</div></div>
+    <div class="gs danger"><div class="gs-lbl">M365 Crítico</div><div class="gs-val">${s.critical_m365||0}</div><div class="gs-hint">Admins de workload M365</div></div>
     <div class="gs ok"><div class="gs-lbl">Última coleta</div><div class="gs-val" style="font-size:14px;padding-top:4px">${new Date(data.collected_at).toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"})}</div><div class="gs-hint">${new Date(data.collected_at).toLocaleDateString("pt-BR")}</div></div>
   `;
 
@@ -441,6 +465,9 @@ function render(data){
 
   // Entra ID table
   buildEntraTable(data.entra_assignments);
+
+  // Grupos monitorados
+  buildGroupsTabs(data.watched_groups);
 
   // footer
   document.getElementById("footer").textContent=
@@ -529,31 +556,38 @@ function renderAzureTbl(subId, rows, showSub){
   render();
 }
 
+function workloadBadge(w){
+  return w==="M365" ? '<span class="pt-s">M365</span>' : '<span class="pt-g">ENTRA</span>';
+}
+
 function buildEntraTable(rows){
   const tbody=document.getElementById("tbl-entra");
   const srch=document.getElementById("srch-entra");
   const fsel=document.getElementById("fsel-entra");
   const ftype=document.getElementById("ftype-entra");
+  const fwl=document.getElementById("fwl-entra");
   const rc=document.getElementById("rc-entra");
   const emp=document.getElementById("empty-entra");
   document.getElementById("entra-count").textContent=rows.length+" atribuições";
 
   function render(){
-    const q=(srch.value||"").toLowerCase(), pf=fsel.value, pt=ftype.value;
+    const q=(srch.value||"").toLowerCase(), pf=fsel.value, pt=ftype.value, wl=fwl.value;
     let n=0, prevP=null;
     tbody.innerHTML="";
     rows.forEach(r=>{
       if(pf&&r.risk_level!==pf) return;
       if(pt&&r.principal_type!==pt) return;
+      if(wl&&(r.workload||"Entra ID")!==wl) return;
       if(q&&!(r.principal+r.role).toLowerCase().includes(q)) return;
       n++;
       const tr=document.createElement("tr"); tr.className="dr";
       const td1=document.createElement("td"); if(r.principal!==prevP){td1.innerHTML=`<span class="mono">${r.principal}</span>`;prevP=r.principal;}
       const td2=document.createElement("td"); td2.innerHTML=typePill(r.principal_type);
       const td3=document.createElement("td"); td3.innerHTML=`<span class="mono" style="font-size:11px">${r.role}</span>`;
-      const td4=document.createElement("td"); td4.innerHTML=`<span class="pill ${TC[r.risk_level]||'pi'}">${r.risk_level}</span>`;
-      const td5=document.createElement("td"); td5.innerHTML=`<span class="mono" style="font-size:10.5px">${r.scope}</span>`;
-      tr.append(td1,td2,td3,td4,td5); tbody.appendChild(tr);
+      const td4=document.createElement("td"); td4.innerHTML=workloadBadge(r.workload||"Entra ID");
+      const td5=document.createElement("td"); td5.innerHTML=`<span class="pill ${TC[r.risk_level]||'pi'}">${r.risk_level}</span>`;
+      const td6=document.createElement("td"); td6.innerHTML=`<span class="mono" style="font-size:10.5px">${r.scope}</span>`;
+      tr.append(td1,td2,td3,td4,td5,td6); tbody.appendChild(tr);
     });
     rc.textContent=n+" atribuições";
     emp.style.display=n===0?"":"none";
@@ -561,6 +595,74 @@ function buildEntraTable(rows){
   srch.addEventListener("input",render);
   fsel.addEventListener("change",render);
   ftype.addEventListener("change",render);
+  fwl.addEventListener("change",render);
+  render();
+}
+
+function buildGroupsTabs(groups){
+  const titleEl=document.getElementById("groups-section-title");
+  const panelEl=document.getElementById("groups-panel");
+  if(!groups||!groups.length){titleEl.style.display="none";panelEl.style.display="none";return;}
+  titleEl.style.display="";panelEl.style.display="";
+
+  const tabsEl=document.getElementById("groups-tabs");
+  const panelsEl=document.getElementById("groups-panels");
+  tabsEl.innerHTML=""; panelsEl.innerHTML="";
+
+  groups.forEach((g,i)=>{
+    const btn=document.createElement("button");
+    btn.className="stab"+(i===0?" active":"");
+    btn.dataset.panel="grp-"+g.id;
+    btn.innerHTML=`${g.name} <span class="stab-cnt">${g.members.length}</span>`;
+    tabsEl.appendChild(btn);
+
+    const panel=document.createElement("div");
+    panel.className="tab-panel"+(i===0?" active":"");
+    panel.id="grp-"+g.id;
+    panel.innerHTML=`
+      <div class="toolbar">
+        <div class="sw"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg><input class="srch" data-tbl="grp-tbl-${g.id}" placeholder="Filtrar…"></div>
+        <span class="rcount" id="rc-grp-${g.id}"></span>
+      </div>
+      <div class="tw"><table><thead><tr><th>Membro</th><th>Tipo</th></tr></thead><tbody id="grp-tbl-${g.id}"></tbody></table></div>
+      <div class="empty" id="grp-empty-${g.id}" style="display:none">Nenhum membro.</div>
+    `;
+    panelsEl.appendChild(panel);
+    renderGroupTbl(g.id, g.members);
+  });
+
+  tabsEl.addEventListener("click",e=>{
+    const btn=e.target.closest(".stab"); if(!btn) return;
+    tabsEl.querySelectorAll(".stab").forEach(t=>t.classList.remove("active"));
+    panelsEl.querySelectorAll(".tab-panel").forEach(p=>p.classList.remove("active"));
+    btn.classList.add("active");
+    document.getElementById(btn.dataset.panel).classList.add("active");
+  });
+}
+
+function renderGroupTbl(gid, members){
+  const tbody=document.getElementById("grp-tbl-"+gid);
+  const rcEl=document.getElementById("rc-grp-"+gid);
+  const empEl=document.getElementById("grp-empty-"+gid);
+  const panel=tbody.closest(".tab-panel");
+  const srch=panel.querySelector(`input[data-tbl="grp-tbl-${gid}"]`);
+
+  function render(){
+    const q=(srch.value||"").toLowerCase();
+    let n=0;
+    tbody.innerHTML="";
+    members.forEach(m=>{
+      if(q&&!(m.principal||"").toLowerCase().includes(q)) return;
+      n++;
+      const tr=document.createElement("tr"); tr.className="dr";
+      const td1=document.createElement("td"); td1.innerHTML=`<span class="mono">${m.principal}</span>`;
+      const td2=document.createElement("td"); td2.innerHTML=typePill(m.principal_type);
+      tr.append(td1,td2); tbody.appendChild(tr);
+    });
+    rcEl.textContent=n+" membros";
+    empEl.style.display=n===0?"":"none";
+  }
+  srch.addEventListener("input",render);
   render();
 }
 
@@ -568,10 +670,10 @@ function exportCSV(type){
   if(!_data) return;
   const rows = type==="entra" ? _data.entra_assignments : _data.azure_assignments;
   const hdrs = type==="entra"
-    ? ["Tipo","Principal","Role_EntraID","Nivel_Risco","Escopo"]
+    ? ["Tipo","Principal","Role","Origem","Nivel_Risco","Escopo"]
     : ["Subscription","Subscription_ID","Tipo_Principal","Principal","Role","Nivel_Risco","Tipo_Escopo","Escopo"];
   const keyMap = type==="entra"
-    ? {Tipo:"principal_type",Principal:"principal",Role_EntraID:"role",Nivel_Risco:"risk_level",Escopo:"scope"}
+    ? {Tipo:"principal_type",Principal:"principal",Role:"role",Origem:"workload",Nivel_Risco:"risk_level",Escopo:"scope"}
     : {Subscription:"subscription",Subscription_ID:"subscription_id",Tipo_Principal:"principal_type",Principal:"principal",Role:"role",Nivel_Risco:"risk_level",Tipo_Escopo:"scope_type",Escopo:"scope"};
   const lines=["\\uFEFF"+hdrs.join(","), ...rows.map(r=>hdrs.map(h=>esc(r[keyMap[h]]??"")).join(","))];
   const fname=type==="entra"?"entra_id_audit.csv":"azure_rbac_audit.csv";
